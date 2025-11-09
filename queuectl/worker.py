@@ -1,339 +1,261 @@
 """
-CLI interface for queuectl
-Provides command-line interface for all queue operations
+Worker process management for queuectl
+Handles job execution, retry logic, and worker coordination
 """
-import click
-import json
+import subprocess
+import time
+import signal
 import sys
-from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Optional
+from multiprocessing import Process, Event
+import uuid
 
 from .storage import Storage
 from .config import Config
-from .queue import Queue
-from .worker import WorkerManager
-from .models import JobState
+from .models import Job, JobState
 
 
-# Initialize storage, config, and queue (lazy loaded)
-_storage = None
-_config = None
-_queue = None
+# Constants
+MAX_OUTPUT_LEN = 2000
+DEFAULT_TIMEOUT = 300
 
 
-def get_storage() -> Storage:
-    """Get or create storage instance"""
-    global _storage
-    if _storage is None:
-        _storage = Storage()
-    return _storage
-
-
-def get_config() -> Config:
-    """Get or create config instance"""
-    global _config
-    if _config is None:
-        _config = Config(get_storage())
-    return _config
-
-
-def get_queue() -> Queue:
-    """Get or create queue instance"""
-    global _queue
-    if _queue is None:
-        _queue = Queue(get_storage(), get_config())
-    return _queue
-
-
-@click.group()
-def cli():
-    """queuectl - A CLI-based background job queue system"""
-    pass
-
-
-@cli.command()
-@click.argument('job_json')
-def enqueue(job_json):
-    """
-    Enqueue a new job
+class Worker:
+    """Worker process that executes jobs from the queue"""
     
-    Example: queuectl enqueue '{"id":"job1","command":"sleep 2"}'
-    """
-    try:
-        job_data = json.loads(job_json)
+    def __init__(self, worker_id: str, storage: Storage, config: Config, shutdown_event: Event):
+        """
+        Initialize worker
         
-        queue = get_queue()
-        job = queue.enqueue(job_data)
+        Args:
+            worker_id: Unique worker identifier
+            storage: Storage instance
+            config: Config instance
+            shutdown_event: Multiprocessing event for graceful shutdown
+        """
+        self.worker_id = worker_id
+        self.storage = storage
+        self.config = config
+        self.shutdown_event = shutdown_event
+        self.poll_interval = config.get('worker_poll_interval', 1)
+    
+    def run(self):
+        """Main worker loop - poll for jobs and execute them"""
+        print(f"[Worker {self.worker_id}] Started")
         
-        if job:
-            click.echo(f"✓ Job enqueued successfully")
-            click.echo(f"  ID: {job.id}")
-            click.echo(f"  Command: {job.command}")
-            click.echo(f"  State: {job.state}")
+        while not self.shutdown_event.is_set():
+            try:
+                # Check for stop file (for `queuectl worker stop` command)
+                from pathlib import Path
+                stop_file = Path.home() / ".queuectl" / "stop"
+                if stop_file.exists():
+                    print(f"[Worker {self.worker_id}] Stop file detected, shutting down")
+                    self.shutdown_event.set()
+                    break
+                
+                # Try to claim a job
+                job_data = self.storage.claim_job(self.worker_id)
+                
+                if job_data:
+                    job = Job.from_dict(job_data)
+                    print(f"[Worker {self.worker_id}] Claimed job {job.id}")
+                    
+                    # Execute the job
+                    self.execute_job(job)
+                else:
+                    # No jobs available, wait before polling again
+                    time.sleep(self.poll_interval)
+            
+            except Exception as e:
+                print(f"[Worker {self.worker_id}] Error in main loop: {e}")
+                time.sleep(self.poll_interval)
+        
+        print(f"[Worker {self.worker_id}] Shutdown signal received, exiting")
+    
+    def execute_job(self, job: Job):
+        """
+        Execute a job command
+        
+        Args:
+            job: Job to execute
+        """
+        timeout = self.config.get('job_timeout', DEFAULT_TIMEOUT)
+        
+        try:
+            print(f"[Worker {self.worker_id}] Executing: {job.command}")
+            
+            result = subprocess.run(
+                job.command,
+                shell=True,
+                capture_output=True,
+                timeout=timeout,
+                text=True
+            )
+            
+            # Truncate output to avoid bloated database
+            stdout = result.stdout[:MAX_OUTPUT_LEN] if result.stdout else ""
+            stderr = result.stderr[:MAX_OUTPUT_LEN] if result.stderr else ""
+            
+            # Determine outcome based on exit code
+            if result.returncode == 0:
+                self.mark_completed(job, stdout, stderr, result.returncode)
+            else:
+                self.handle_failure(job, stdout, stderr, result.returncode)
+        
+        except subprocess.TimeoutExpired:
+            print(f"[Worker {self.worker_id}] Job {job.id} timed out after {timeout}s")
+            self.handle_failure(
+                job,
+                "",
+                f"Job exceeded timeout of {timeout} seconds",
+                -1
+            )
+        
+        except Exception as e:
+            print(f"[Worker {self.worker_id}] Job {job.id} execution error: {e}")
+            self.handle_failure(
+                job,
+                "",
+                f"Execution error: {str(e)}",
+                -1
+            )
+    
+    def mark_completed(self, job: Job, stdout: str, stderr: str, exit_code: int):
+        """
+        Mark job as completed successfully
+        
+        Args:
+            job: Job that completed
+            stdout: Standard output
+            stderr: Standard error
+            exit_code: Exit code
+        """
+        print(f"[Worker {self.worker_id}] Job {job.id} completed successfully")
+        
+        updates = {
+            'state': JobState.COMPLETED,
+            'stdout': stdout,
+            'stderr': stderr,
+            'exit_code': exit_code,
+        }
+        
+        self.storage.update_job(job.id, updates)
+    
+    def handle_failure(self, job: Job, stdout: str, stderr: str, exit_code: int):
+        """
+        Handle job failure with retry logic
+        
+        Args:
+            job: Job that failed
+            stdout: Standard output
+            stderr: Standard error
+            exit_code: Exit code
+        """
+        print(f"[Worker {self.worker_id}] Job {job.id} failed (attempt {job.attempts}/{job.max_retries})")
+        
+        updates = {
+            'stdout': stdout,
+            'stderr': stderr,
+            'exit_code': exit_code,
+        }
+        
+        # Check if job should be retried or moved to DLQ
+        if job.attempts >= job.max_retries:
+            # Move to Dead Letter Queue
+            print(f"[Worker {self.worker_id}] Job {job.id} moved to DLQ after {job.attempts} attempts")
+            updates['state'] = JobState.DEAD
         else:
-            click.echo(f"✗ Failed to enqueue job (ID may already exist)", err=True)
-            sys.exit(1)
-    
-    except json.JSONDecodeError as e:
-        click.echo(f"✗ Invalid JSON: {e}", err=True)
-        sys.exit(1)
-    except ValueError as e:
-        click.echo(f"✗ Error: {e}", err=True)
-        sys.exit(1)
-
-
-@cli.group()
-def worker():
-    """Worker management commands"""
-    pass
-
-
-@worker.command()
-@click.option('--count', default=1, help='Number of workers to start')
-def start(count):
-    """
-    Start worker processes
-    
-    Example: queuectl worker start --count 3
-    """
-    storage = get_storage()
-    config = get_config()
-    
-    manager = WorkerManager(storage, config)
-    manager.start_workers(count)
-
-
-@worker.command()
-def stop():
-    """
-    Stop running workers
-    
-    Note: This command works best when workers are running in foreground mode.
-    For background workers, use system commands like 'kill' with PID.
-    """
-    # Create stop flag file
-    stop_file = Path.home() / ".queuectl" / "stop"
-    stop_file.parent.mkdir(parents=True, exist_ok=True)
-    stop_file.touch()
-    
-    click.echo("✓ Stop signal sent to workers")
-    click.echo("  Workers will finish their current jobs and then exit")
-    
-    # Clean up stop file after a moment
-    import time
-    time.sleep(2)
-    if stop_file.exists():
-        stop_file.unlink()
-
-
-@cli.command()
-def status():
-    """
-    Show queue status
-    
-    Example: queuectl status
-    """
-    queue = get_queue()
-    status_info = queue.get_status()
-    
-    click.echo("=" * 50)
-    click.echo("QUEUE STATUS")
-    click.echo("=" * 50)
-    
-    # Job counts by state
-    jobs = status_info['jobs']
-    click.echo(f"\nJobs:")
-    click.echo(f"  Pending:    {jobs['pending']:>5}")
-    click.echo(f"  Processing: {jobs['processing']:>5}")
-    click.echo(f"  Completed:  {jobs['completed']:>5}")
-    click.echo(f"  Failed:     {jobs['failed']:>5}")
-    click.echo(f"  Dead (DLQ): {jobs['dead']:>5}")
-    click.echo(f"  {'-' * 20}")
-    click.echo(f"  Total:      {status_info['total_jobs']:>5}")
-    
-    # Workers
-    click.echo(f"\nActive Workers: {status_info['active_workers']}")
-    
-    # Config
-    config = get_config()
-    all_config = config.get_all()
-    click.echo(f"\nConfiguration:")
-    for key, value in sorted(all_config.items()):
-        click.echo(f"  {key}: {value}")
-    
-    click.echo("=" * 50)
-
-
-@cli.command()
-@click.option('--state', type=click.Choice(['pending', 'processing', 'completed', 'failed', 'dead']), 
-              help='Filter by job state')
-@click.option('--limit', default=20, help='Maximum number of jobs to display')
-def list(state, limit):
-    """
-    List jobs
-    
-    Example: queuectl list --state pending
-    """
-    queue = get_queue()
-    jobs = queue.list_jobs(state)
-    
-    if not jobs:
-        click.echo(f"No jobs found" + (f" with state '{state}'" if state else ""))
-        return
-    
-    # Limit results
-    jobs = jobs[:limit]
-    
-    click.echo("=" * 100)
-    click.echo(f"{'ID':<20} {'STATE':<12} {'COMMAND':<30} {'ATTEMPTS':<10} {'CREATED':<20}")
-    click.echo("=" * 100)
-    
-    for job in jobs:
-        job_id = job.id[:18] + '..' if len(job.id) > 20 else job.id
-        command = job.command[:28] + '..' if len(job.command) > 30 else job.command
-        created = job.created_at[:19] if job.created_at else 'N/A'
+            # Schedule retry with exponential backoff
+            backoff_base = self.config.get('backoff_base', 2)
+            delay = backoff_base ** job.attempts
+            run_at = datetime.utcnow() + timedelta(seconds=delay)
+            
+            print(f"[Worker {self.worker_id}] Job {job.id} will retry in {delay}s")
+            
+            updates['state'] = JobState.PENDING
+            updates['run_at'] = run_at.isoformat()
+            updates['worker_id'] = None
+            updates['locked_at'] = None
         
-        click.echo(f"{job_id:<20} {job.state:<12} {command:<30} {job.attempts:<10} {created:<20}")
-    
-    if len(jobs) == limit:
-        click.echo(f"\n(Showing first {limit} jobs, use --limit to see more)")
-    
-    click.echo("=" * 100)
+        self.storage.update_job(job.id, updates)
 
 
-@cli.group()
-def dlq():
-    """Dead Letter Queue management"""
-    pass
-
-
-@dlq.command('list')
-@click.option('--limit', default=20, help='Maximum number of jobs to display')
-def dlq_list(limit):
-    """
-    List jobs in Dead Letter Queue
+class WorkerManager:
+    """Manages multiple worker processes"""
     
-    Example: queuectl dlq list
-    """
-    queue = get_queue()
-    jobs = queue.list_dlq()
-    
-    if not jobs:
-        click.echo("Dead Letter Queue is empty")
-        return
-    
-    jobs = jobs[:limit]
-    
-    click.echo("=" * 120)
-    click.echo(f"{'ID':<20} {'COMMAND':<30} {'ATTEMPTS':<10} {'EXIT CODE':<12} {'ERROR':<40}")
-    click.echo("=" * 120)
-    
-    for job in jobs:
-        job_id = job.id[:18] + '..' if len(job.id) > 20 else job.id
-        command = job.command[:28] + '..' if len(job.command) > 30 else job.command
-        exit_code = str(job.exit_code) if job.exit_code is not None else 'N/A'
-        error = (job.stderr[:38] + '..') if job.stderr and len(job.stderr) > 40 else (job.stderr or 'N/A')
+    def __init__(self, storage: Storage, config: Config):
+        """
+        Initialize worker manager
         
-        click.echo(f"{job_id:<20} {command:<30} {job.attempts:<10} {exit_code:<12} {error:<40}")
+        Args:
+            storage: Storage instance
+            config: Config instance
+        """
+        self.storage = storage
+        self.config = config
+        self.workers = []
+        self.shutdown_event = Event()
     
-    if len(jobs) == limit:
-        click.echo(f"\n(Showing first {limit} jobs, use --limit to see more)")
+    def start_workers(self, count: int):
+        """
+        Start multiple worker processes
+        
+        Args:
+            count: Number of workers to start
+        """
+        print(f"Starting {count} worker(s)...")
+        
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        for i in range(count):
+            worker_id = f"worker-{uuid.uuid4().hex[:8]}"
+            
+            # Create worker with its own storage instance (for thread safety)
+            worker_storage = Storage(self.storage.db_path)
+            worker = Worker(worker_id, worker_storage, self.config, self.shutdown_event)
+            
+            # Start worker process
+            process = Process(target=worker.run, name=worker_id)
+            process.start()
+            
+            self.workers.append({
+                'id': worker_id,
+                'process': process
+            })
+        
+        print(f"All workers started. Press Ctrl+C to stop.")
+        
+        # Wait for all workers to finish
+        try:
+            for worker_info in self.workers:
+                worker_info['process'].join()
+        except KeyboardInterrupt:
+            pass
+        
+        print("All workers stopped")
     
-    click.echo("=" * 120)
-
-
-@dlq.command('retry')
-@click.argument('job_id')
-def dlq_retry(job_id):
-    """
-    Retry a job from Dead Letter Queue
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals"""
+        print("\nShutdown signal received, stopping workers gracefully...")
+        self.shutdown_event.set()
     
-    Example: queuectl dlq retry job1
-    """
-    queue = get_queue()
-    success = queue.retry_job(job_id)
-    
-    if success:
-        click.echo(f"✓ Job {job_id} moved from DLQ to pending queue")
-    else:
-        click.echo(f"✗ Failed to retry job {job_id} (job not found or not in DLQ)", err=True)
-        sys.exit(1)
-
-
-@cli.group()
-def config():
-    """Configuration management"""
-    pass
-
-
-@config.command('set')
-@click.argument('key')
-@click.argument('value')
-def config_set(key, value):
-    """
-    Set configuration value
-    
-    Example: queuectl config set max-retries 5
-    """
-    # Convert hyphenated key to underscore
-    key = key.replace('-', '_')
-    
-    cfg = get_config()
-    
-    if not cfg.is_valid_key(key):
-        click.echo(f"✗ Invalid configuration key: {key}", err=True)
-        click.echo(f"  Valid keys: {', '.join(sorted(cfg.VALID_KEYS))}")
-        sys.exit(1)
-    
-    # Try to convert value to appropriate type
-    try:
-        if '.' in value:
-            value = float(value)
-        else:
-            value = int(value)
-    except ValueError:
-        pass  # Keep as string
-    
-    cfg.set(key, value)
-    click.echo(f"✓ Configuration updated: {key} = {value}")
-
-
-@config.command('get')
-@click.argument('key')
-def config_get(key):
-    """
-    Get configuration value
-    
-    Example: queuectl config get max-retries
-    """
-    key = key.replace('-', '_')
-    
-    cfg = get_config()
-    value = cfg.get(key)
-    
-    if value is not None:
-        click.echo(f"{key}: {value}")
-    else:
-        click.echo(f"✗ Configuration key not found: {key}", err=True)
-        sys.exit(1)
-
-
-@config.command('list')
-def config_list():
-    """
-    List all configuration values
-    
-    Example: queuectl config list
-    """
-    cfg = get_config()
-    all_config = cfg.get_all()
-    
-    click.echo("Configuration:")
-    click.echo("=" * 50)
-    for key, value in sorted(all_config.items()):
-        click.echo(f"  {key:<25} {value}")
-    click.echo("=" * 50)
-
-
-if __name__ == '__main__':
-    cli()
+    def stop_workers(self):
+        """Stop all running workers gracefully"""
+        print("Requesting worker shutdown...")
+        self.shutdown_event.set()
+        
+        # Wait for workers to finish current jobs
+        for worker_info in self.workers:
+            if worker_info['process'].is_alive():
+                worker_info['process'].join(timeout=30)
+                
+                # Force terminate if still alive after timeout
+                if worker_info['process'].is_alive():
+                    print(f"Force terminating {worker_info['id']}")
+                    worker_info['process'].terminate()
+        
+        self.workers.clear()
+        print("All workers stopped")
