@@ -34,8 +34,7 @@ class Storage:
         """Create tables if they don't exist"""
         conn = self._get_connection()
         cursor = conn.cursor()
-        
-        # Create jobs table
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
@@ -53,11 +52,11 @@ class Storage:
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_run_at ON jobs(run_at)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_locked_at ON jobs(locked_at)")
-        
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS config (
                 key TEXT PRIMARY KEY,
@@ -125,8 +124,7 @@ class Storage:
         """
         conn = self._get_connection()
         cursor = conn.cursor()
-        
-        # Atomic update with safety timeout check
+
         cursor.execute("""
             UPDATE jobs 
             SET state = 'processing',
@@ -140,7 +138,7 @@ class Storage:
                     state = 'pending'
                     OR (state = 'processing' AND locked_at < datetime('now', '-5 minutes'))
                 )
-                AND (run_at IS NULL OR run_at <= CURRENT_TIMESTAMP)
+                AND (run_at IS NULL OR datetime(run_at) <= datetime('now'))
                 ORDER BY created_at ASC
                 LIMIT 1
             )
@@ -149,7 +147,6 @@ class Storage:
         conn.commit()
         
         if cursor.rowcount > 0:
-            # Get the claimed job
             cursor.execute("""
                 SELECT * FROM jobs 
                 WHERE worker_id = ? AND state = 'processing'
@@ -205,8 +202,7 @@ class Storage:
         """)
         
         stats = {row['state']: row['count'] for row in cursor.fetchall()}
-        
-        # Ensure all states are present
+
         for state in ['pending', 'processing', 'completed', 'failed', 'dead']:
             if state not in stats:
                 stats[state] = 0
