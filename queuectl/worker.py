@@ -8,7 +8,7 @@ import signal
 import sys
 from datetime import datetime, timedelta
 from typing import Optional
-from multiprocessing import Process, Event
+from multiprocessing import Process, Manager
 import uuid
 
 from .storage import Storage
@@ -21,7 +21,7 @@ MAX_OUTPUT_LEN = 2000
 DEFAULT_TIMEOUT = 300
 
 
-def _worker_process(worker_id: str, db_path: str, shutdown_event: Event):
+def _worker_process(worker_id, db_path, shutdown_event):
     """
     Worker process function (must be at module level for multiprocessing)
     This is called by WorkerManager in a separate process.
@@ -29,7 +29,7 @@ def _worker_process(worker_id: str, db_path: str, shutdown_event: Event):
     Args:
         worker_id: Unique worker identifier
         db_path: Path to database
-        shutdown_event: Shutdown event
+        shutdown_event: Shutdown event (shared between processes)
     """
     # Create storage and config instances in this process
     storage = Storage(db_path)
@@ -43,7 +43,7 @@ def _worker_process(worker_id: str, db_path: str, shutdown_event: Event):
 class Worker:
     """Worker process that executes jobs from the queue"""
     
-    def __init__(self, worker_id: str, storage: Storage, config: Config, shutdown_event: Event):
+    def __init__(self, worker_id, storage, config, shutdown_event):
         """
         Initialize worker
         
@@ -92,7 +92,7 @@ class Worker:
         
         print(f"[Worker {self.worker_id}] Shutdown signal received, exiting")
     
-    def execute_job(self, job: Job):
+    def execute_job(self, job):
         """
         Execute a job command
         
@@ -140,7 +140,7 @@ class Worker:
                 -1
             )
     
-    def mark_completed(self, job: Job, stdout: str, stderr: str, exit_code: int):
+    def mark_completed(self, job, stdout, stderr, exit_code):
         """
         Mark job as completed successfully
         
@@ -161,7 +161,7 @@ class Worker:
         
         self.storage.update_job(job.id, updates)
     
-    def handle_failure(self, job: Job, stdout: str, stderr: str, exit_code: int):
+    def handle_failure(self, job, stdout, stderr, exit_code):
         """
         Handle job failure with retry logic
         
@@ -200,29 +200,10 @@ class Worker:
         self.storage.update_job(job.id, updates)
 
 
-def _worker_process(worker_id: str, db_path: str, config_dict: dict, shutdown_event: Event):
-    """
-    Worker process function (must be at module level for multiprocessing)
-    
-    Args:
-        worker_id: Unique worker identifier
-        db_path: Path to database
-        config_dict: Configuration dictionary
-        shutdown_event: Shutdown event
-    """
-    # Create storage and config instances in this process
-    storage = Storage(db_path)
-    config = Config(storage)
-    
-    # Create and run worker
-    worker = Worker(worker_id, storage, config, shutdown_event)
-    worker.run()
-
-
 class WorkerManager:
     """Manages multiple worker processes"""
     
-    def __init__(self, storage: Storage, config: Config):
+    def __init__(self, storage, config):
         """
         Initialize worker manager
         
@@ -233,9 +214,11 @@ class WorkerManager:
         self.storage = storage
         self.config = config
         self.workers = []
-        self.shutdown_event = Event()
+        # Use Manager for cross-process Event
+        self.manager = Manager()
+        self.shutdown_event = self.manager.Event()
     
-    def start_workers(self, count: int):
+    def start_workers(self, count):
         """
         Start multiple worker processes
         
@@ -247,9 +230,6 @@ class WorkerManager:
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
-        
-        # Get config dict to pass to workers
-        config_dict = self.config.get_all()
         
         for i in range(count):
             worker_id = f"worker-{uuid.uuid4().hex[:8]}"

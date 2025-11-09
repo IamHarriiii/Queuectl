@@ -123,7 +123,7 @@ def test_2_failed_job_retries_and_dlq():
     
     # Wait for retries and DLQ move
     print("Waiting for retries (this may take a few seconds)...")
-    time.sleep(10)
+    time.sleep(15)
     
     # Stop worker
     print("Stopping worker...")
