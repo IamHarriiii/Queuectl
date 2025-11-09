@@ -120,7 +120,6 @@ class Queue:
         if job.state != JobState.DEAD:
             return False
         
-        # Reset job state for retry
         updates = {
             'state': JobState.PENDING,
             'attempts': 0,
