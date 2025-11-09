@@ -64,4 +64,3 @@ echo "Run tests:"
 echo "  python3 tests/test_scenarios.py"
 echo
 echo "For more information, see README.md"
-echo

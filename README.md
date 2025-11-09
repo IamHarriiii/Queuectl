@@ -24,7 +24,7 @@ A production-grade CLI-based background job queue system with worker processes, 
 ### 1. Clone the Repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/IamHarriiii/Queuectl.git
 cd queuectl
 ```
 
@@ -414,10 +414,8 @@ This project is created for educational purposes as part of a backend developer 
 
 ## 👤 Author
 
-[Your Name]
-[Your Email]
-[GitHub Profile]
+HARINARAYANAN U
+hari.narayanan1402@gmail.com
+https://github.com/IamHarriiii
 
 ---
-
-**Built with ❤️ for QueueCTL Backend Internship Assignment**
