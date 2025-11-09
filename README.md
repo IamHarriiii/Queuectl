@@ -381,9 +381,9 @@ queuectl/
 - ✅ **Safety timeout** - Auto-recovery of jobs from crashed workers
 - ✅ **DLQ retry** - Move jobs from DLQ back to queue
 
-## 🎥 Demo Video
+## 🎥 Demo 
 
-[Link to demo video showing all features]
+https://drive.google.com/file/d/1xGuwrG4USCyO1zYnsmwxv8DplZ3bvC3A/view?usp=sharing
 
 ## 📝 Notes
 
